@@ -214,16 +214,14 @@ def direction(clause):
     return d, flags
 
 
-def detect_bank(title, text):
-    for src in (title, text):
-        best = None
-        for label, rx in BANK_PATTERNS:
-            m = re.search(rx, src, re.I)
-            if m and (best is None or m.start() < best[0]):
-                best = (m.start(), label)
-        if best:
-            return best[1]
-    return None
+def detect_bank(title):
+    """Banka mora biti u NASLOVU. Description/body se ne koristi za kvalifikaciju."""
+    best = None
+    for label, rx in BANK_PATTERNS:
+        m = re.search(rx, title, re.I)
+        if m and (best is None or m.start() < best[0]):
+            best = (m.start(), label)
+    return best[1] if best else None
 
 
 def find_horizon(text):
@@ -235,8 +233,8 @@ def find_horizon(text):
 
 
 def origin_of(item):
-    src = item.get("source") or ""
-    m = WIRE_RE.search(src) or WIRE_RE.search(item["title"] + " " + item["desc"])
+    # samo iz source polja feed-a; pominjanje u description-u se ignorise
+    m = WIRE_RE.search(item.get("source") or "")
     return m.group(1) if m else None
 
 
@@ -252,7 +250,7 @@ def classify(item):
     desc = item["desc"]
     text = title if (not desc or desc[:30].lower() in title.lower() or title[:30].lower() in desc.lower()) \
         else f"{title}. {desc}"
-    bank = detect_bank(title, text)
+    bank = detect_bank(title)
     if not bank:
         return None
 
@@ -559,6 +557,13 @@ def selftest():
         ("Citi: long-term view on yen unchanged", None),
     ]
     ok = True
+    # MUST REJECT: banka samo u description-u
+    rej = mk("investingLive Asia-Pacific market news: Saudi-Houthi attacks and Gulf storm lift oil",
+             "investingLive",
+             "Goldman Sachs sees USDJPY higher, recommends buy USD/JPY, target 158.50 (per Reuters)")
+    good = classify(rej) is None
+    ok &= good
+    print(("PASS " if good else "FAIL "), "MUST REJECT: banka samo u description-u")
     for title, exp in cases:
         c = classify(mk(title))
         if exp is None:
