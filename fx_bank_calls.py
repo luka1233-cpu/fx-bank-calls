@@ -65,10 +65,10 @@ AGAINST_RE = re.compile(r"\b(?:against|vs\.?|versus|relative to)\b", re.I)
 # ----------------------------------------------------------------- smer
 NOT_TERM = r"(?![- ]term)"
 UP_RE = re.compile(
-    r"\b(?:rise|rises|rising|rally\w*|climb\w*|higher|gain\w*|strengthen\w*|stronger|appreciat\w*|"
+    r"\b(?:rise|rises|rising|rally\w*|climb\w*|higher|gain\w*|strengthen\w*|stronger|strength|appreciat\w*|"
     r"advance\w*|bullish|buy\w*|long" + NOT_TERM + r"|upside|upgrade\w*|surge\w*|jump\w*|rebound\w*|recover\w*)\b")
 DOWN_RE = re.compile(
-    r"\b(?:fall\w*|drop\w*|declin\w*|lower|slump\w*|weaken\w*|weaker|depreciat\w*|bearish|sell\w*|"
+    r"\b(?:bet(?:s|ting)?\s+against|fall\w*|drop\w*|declin\w*|lower|slump\w*|weaken\w*|weaker|weakness|depreciat\w*|bearish|sell\w*|"
     r"short" + NOT_TERM + r"|downside|downgrade\w*|slide\w*|slid|tumble\w*|plunge\w*|sink\w*|retreat\w*|slip\w*)\b")
 REV_UP_RE = re.compile(
     r"\b(?:rais\w*|lift\w*|hik\w*|boost\w*|upgrad\w*)\b[^.;:]{0,40}?\b(?:forecasts?|targets?|projections?|estimates?)\b")
@@ -96,6 +96,14 @@ FORECAST_RE = re.compile(
 NOISE = ["shares", "stock ", "stocks", "equity", "equities", "s&p", "nasdaq", "earnings", "ipo",
          "etf", "bond ", "bonds", "treasury", "crude", "oil ", "bitcoin", "crypto", "gold ",
          "copper", "credit", "mortgage", "lawsuit", "stake"]
+
+# B: NOISE za pair granu: bez rates/credit reci (bond, treasury, credit...) jer cesto legitimno pokrecu FX
+PAIR_NOISE = [n for n in NOISE if n.strip() not in {"bond", "bonds", "treasury", "credit", "mortgage", "lawsuit"}]
+
+# A: pomocne klauze
+SUBORD_RE = re.compile(r"\b(?:as|while|amid|after|ahead of)\b", re.I)
+SUB_EXEMPT_RE = re.compile(r"\b(?:sees?|expects?|forecast\w*|predict\w*|bullish|bearish|recommend\w*)\b", re.I)
+SEGMENT_SPLIT = re.compile(r"[;:]|\.\s+")
 
 # ----------------------------------------------------------------- nivoi
 NUM = r"(\d{1,3}(?:\.\d{1,5})?)\b(?!\s?%)"
@@ -245,6 +253,54 @@ def source_rank(item):
     return RANK_BY_NAME.get((item.get("source") or "").lower(), 4)
 
 
+def _content_words(s):
+    for _, rx in BANK_PATTERNS:
+        s = re.sub(rx, " ", s, flags=re.I)
+    return len(re.findall(r"[A-Za-z0-9&'/.-]+", s))
+
+
+def subordinate_cut(text, raw):
+    """A: index gde pocinje pomocna klauza (as/while/amid/after/ahead of) ako se PRVI pair
+    pojavljuje samo u njoj; inace None. Konzervativno: glavni deo mora imati >=3 reci (bez banke),
+    a pomocna klauza ne sme sadrzati sam poziv (sees/expects/forecast/bullish/bearish/recommend/trade)."""
+    pos = text.find(raw)
+    if pos < 0:
+        return None
+    seg_start, seg_end = 0, len(text)
+    for m in SEGMENT_SPLIT.finditer(text):
+        if m.end() <= pos:
+            seg_start = m.end()
+        elif m.start() >= pos:
+            seg_end = m.start()
+            break
+    m = SUBORD_RE.search(text[seg_start:pos])
+    if not m:
+        return None
+    cut = seg_start + m.start()
+    if _content_words(text[seg_start:cut]) < 3:
+        return None
+    sub = text[cut:seg_end]
+    low = sub.lower()
+    if (SUB_EXEMPT_RE.search(sub) or TRADE_RE.search(sub) or TRADE_ACT.search(sub)
+            or REV_UP_RE.search(low) or REV_DOWN_RE.search(low)):
+        return None
+    return cut
+
+
+def trim_after_sub(clause, raw):
+    """Smer pair-a se cita iz glavnog dela: odseca pomocnu klauzu koja dolazi posle para."""
+    p = clause.find(raw)
+    m = SUBORD_RE.search(clause, p + len(raw)) if p >= 0 else None
+    return clause[:m.start()] if m else clause
+
+
+def pair_noise_scope(text, raw):
+    """B: NOISE se trazi samo u glavnom delu (do pomocne klauze posle para)."""
+    p = text.find(raw)
+    m = SUBORD_RE.search(text, p + len(raw)) if p >= 0 else None
+    return text[:m.start()] if m else text
+
+
 def classify(item, why=None):
     title = item["title"]
     desc = item["desc"]
@@ -256,20 +312,35 @@ def classify(item, why=None):
             why.append("no bank in title")
         return None
 
-    clauses = [c for c in CLAUSE_SPLIT.split(text) if c and c.strip()]
     pair, inv, raw = find_pair(text)
+    scan_text = text
+    ctx_cut = subordinate_cut(text, raw) if pair else None
+    if ctx_cut is not None:
+        # A: pair je samo u pomocnoj klauzi -> kontekst, ne predmet poziva
+        scan_text = text[:ctx_cut]
+        pair, inv, raw = None, False, None
+    clauses = [c for c in CLAUSE_SPLIT.split(scan_text) if c and c.strip()]
     subj, kind, d, flags = None, None, None, {}
 
     if pair:
         for c in clauses:
             if raw in c:
-                d, flags = direction(c)
+                d, flags = direction(trim_after_sub(c, raw))
+                if d is None:
+                    d, flags = direction(c)
                 break
         if d is None:
             d, flags = direction(text)
         if d is None:
             if why is not None:
                 why.append(f"pair {pair} found but no direction/stance words")
+            return None
+        # B: NOISE i za pair granu (samo glavni deo, bez rates reci, ne ako je eksplicitna trade akcija)
+        scope = (pair_noise_scope(text, raw) + " ").lower()
+        hit = [n.strip() for n in PAIR_NOISE if n in scope]
+        if hit and not TRADE_ACT.search(scope):
+            if why is not None:
+                why.append(f"pair {pair} call dropped by NOISE word in main clause: " + ",".join(hit))
             return None
         if inv:
             d = FLIP.get(d, d)
@@ -299,10 +370,14 @@ def classify(item, why=None):
             break
         if not subj:
             if why is not None:
-                why.append("no G10 pair, and currency word has no direction" if ccy_list(text)
-                           else "no G10 pair or currency word in text")
+                if ctx_cut is not None:
+                    why.append("pair only in subordinate clause (as/while/amid/after/ahead of); "
+                               "main clause has no FX subject with direction")
+                else:
+                    why.append("no G10 pair, and currency word has no direction" if ccy_list(text)
+                               else "no G10 pair or currency word in text")
             return None
-        low = (text + " ").lower()
+        low = ((scan_text if ctx_cut is not None else text) + " ").lower()
         if kind == "ccy" and any(n in low for n in NOISE):
             if why is not None:
                 why.append("currency-only view dropped by NOISE word: "
@@ -680,6 +755,39 @@ def selftest():
         ("Morgan Stanley shares rise on strong earnings", None),
         ("Goldman Sachs sees S&P 500 higher, dollar mixed", None),
         ("Citi: long-term view on yen unchanged", None),
+        # currency-only pozivi
+        ("Morgan Stanley bets against pound ahead of U.K. budget", dict(bank="MORGAN STANLEY", subj="GBP", kind="ccy", dir="DOWN")),
+        ("Goldman Sachs bullish on dollar", dict(subj="USD", kind="ccy", dir="UP")),
+        ("UBS expects weaker yen", dict(subj="JPY", kind="ccy", dir="DOWN")),
+        ("Citi bearish on euro", dict(subj="EUR", kind="ccy", dir="DOWN")),
+        ("Citi expects stronger yen", dict(subj="JPY", kind="ccy", dir="UP")),
+        ("Barclays sees weaker sterling", dict(subj="GBP", kind="ccy", dir="DOWN")),
+        ("Morgan Stanley: dollar to rise", dict(subj="USD", kind="ccy", dir="UP")),
+        ("UBS: euro to fall", dict(subj="EUR", kind="ccy", dir="DOWN")),
+        # MUST REJECT: stock / oil / crypto sa valutom
+        ("Goldman Sachs raises stock price target on exporter as dollar rises", None),
+        ("Citi sees crude oil prices higher as dollar weakens", None),
+        ("Morgan Stanley bets against bitcoin as dollar strengthens", None),
+        ("Barclays bullish on Toyota shares as yen weakens", None),
+        # MUST REJECT: FX par u naslovu, ali poziv je stock/oil/equity
+        ("Goldman Sachs raises Toyota target as USD/JPY weakens", None),
+        ("Citi boosts oil forecast while USD/JPY falls", None),
+        ("UBS bullish on Tesla shares as EUR/USD rises", None),
+        ("Morgan Stanley raises exporter stock target as EUR/USD rises", None),
+        # B samostalno (bez pomocne klauze): stock target + pair u istoj glavnoj klauzi
+        ("Morgan Stanley raises Apple stock target, sees EUR/USD higher", None),
+        # pozitivni: A ne sme da ubije legitimne pozive
+        ("Morgan Stanley sees dollar weakness as USD/JPY drops", dict(subj="USD", kind="ccy", dir="DOWN")),
+        ("Goldman Sachs expects EUR/USD to rise while equities remain weak", dict(subj="EUR/USD", kind="pair", dir="UP")),
+        ("UBS bullish on USD/JPY as oil prices fall", dict(subj="USD/JPY", kind="pair", dir="UP")),
+        # smer + as/while, UP i DOWN
+        ("UBS bearish on USD/JPY as oil prices rise", dict(subj="USD/JPY", kind="pair", dir="DOWN")),
+        ("Goldman Sachs expects EUR/USD to fall while equities rally", dict(subj="EUR/USD", kind="pair", dir="DOWN")),
+        ("Goldman Sachs expects stronger dollar as USD/JPY climbs", dict(subj="USD", kind="ccy", dir="UP")),
+        ("Morgan Stanley sees weaker yen while USD/JPY climbs", dict(subj="JPY", kind="ccy", dir="DOWN")),
+        # izuzeci: poziv u pomocnoj klauzi / rates rec ne ubija FX poziv
+        ("Morgan Stanley warns on USD risk as it recommends selling USD/JPY", dict(subj="USD/JPY", dir="DOWN", type="TRADE")),
+        ("Citi sees Treasury yields pushing USD/JPY higher", dict(subj="USD/JPY", kind="pair", dir="UP")),
     ]
     ok = True
     # MUST REJECT: banka samo u description-u
