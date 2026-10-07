@@ -1,0 +1,16 @@
+# Privremeni, rucno pokretan workflow samo za feed dijagnostiku (ne dira fx-calls.yml)
+name: Feed Diagnostic
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run feed diagnostic
+        run: python feed_diag.py
