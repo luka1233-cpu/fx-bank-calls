@@ -532,6 +532,75 @@ def diagnose(items, now, calls):
     print("[DIAG] =====================================================")
 
 
+FX_TERMS_RE = re.compile(
+    r"\b(?:FX|forex|currency|currencies|foreign exchange|exchange rate|against|vs\.?)\b", re.I)
+CALL_HINT_RE = re.compile(
+    r"\b(?:sees?|expects?|forecast\w*|predict\w*|target\w*|bullish|bearish|buy\w*|sell\w*|long|short|"
+    r"recommend\w*|raises?|cuts?|lowers?|turns?|view|outlook|call|says?|warns?|favou?rs?|upgrad\w*|"
+    r"downgrad\w*|strateg\w*|bets?|trade)\b", re.I)
+
+
+def _norm_reason(r):
+    r = re.sub(r"pair \S+ found", "pair found", r)
+    r = r.split(": ")[0] if r.startswith("currency-only view dropped") else r
+    return r
+
+
+def diagnose_fx(items, now):
+    """PRIVREMENA dijagnostika #2: FX-relevantni naslovi sa bankom u title-u. Ne menja ponasanje."""
+    t = lambda x, n=160: (x or "").replace("\n", " ")[:n]
+    pool = [i for i in items if has_bank(i["title"])]
+    fx = []
+    for i in pool:
+        title = i["title"]
+        pair, _, _ = find_pair(title)
+        if pair or ccy_list(title) or FX_TERMS_RE.search(title):
+            fx.append(i)
+    passed, rejected, suspects = [], [], []
+    print("[DIAG-FX] ================ FX-relevantni TITLE naslovi ================")
+    for n, i in enumerate(fx, 1):
+        why = []
+        c = classify(i, why)
+        print(f"[DIAG-FX] #{n}")
+        print(f"[DIAG-FX]   TITLE : {t(i['title'])}")
+        print(f"[DIAG-FX]   SOURCE: {i.get('source')}")
+        print(f"[DIAG-FX]   DESC  : {t(i['desc'], 200)}")
+        if c is not None:
+            age_h = (now - i["dt"]).total_seconds() / 3600
+            old = f" (PRESTARO {age_h:.1f}h)" if now - i["dt"] > MAX_AGE else ""
+            print(f"[DIAG-FX]   RESULT: PASS -> {c['bank']} | {c['subj']} | {c['dir']} | {c['type']} | "
+                  f"tp={c['tp']} sl={c['sl']} hz={c['horizon']}{old}")
+            passed.append(i)
+        else:
+            reason = "; ".join(why) or "unknown"
+            print(f"[DIAG-FX]   RESULT: REJECT")
+            print(f"[DIAG-FX]   WHY   : {reason}")
+            rejected.append((i, reason))
+            title = i["title"]
+            pair, _, _ = find_pair(title)
+            if (pair or ccy_list(title)) and CALL_HINT_RE.search(title):
+                suspects.append((i, reason))
+    print("[DIAG-FX] ---------------------------- zbir ----------------------------")
+    print(f"[DIAG-FX] banka u TITLE-u (ukupno): {len(pool)}")
+    print(f"[DIAG-FX] FX-relevant TITLE stavke: {len(fx)}")
+    print(f"[DIAG-FX] classify PASS: {len(passed)}")
+    print(f"[DIAG-FX] REJECT: {len(rejected)}")
+    groups = {}
+    for _, r in rejected:
+        for part in r.split("; "):
+            groups[_norm_reason(part)] = groups.get(_norm_reason(part), 0) + 1
+    for r, n in sorted(groups.items(), key=lambda x: -x[1]):
+        print(f"[DIAG-FX]    {n:3d} x {r}")
+    print("[DIAG-FX] ------- SUMNJIVI PROMASAJI (par/valuta + bank + call-rec u naslovu, a REJECT) -------")
+    print("[DIAG-FX] (heuristika samo za dijagnostiku; moze sadrzati i lazne alarme)")
+    for i, r in suspects:
+        print(f"[DIAG-FX]   SUSPECT: {t(i['title'])} | source={i.get('source')} | razlog: {r}")
+        print(f"[DIAG-FX]            DESC: {t(i['desc'], 200)}")
+    if not suspects:
+        print("[DIAG-FX]   (nema)")
+    print("[DIAG-FX] =============================================================")
+
+
 def send(msg):
     if DRY_RUN or not WEBHOOK:
         print(msg, "\n" + "-" * 40)
@@ -575,6 +644,7 @@ def main():
     calls = build_calls(items, state, now)
     if os.environ.get("DIAG", "1") == "1":
         diagnose(items, now, calls)
+        diagnose_fx(items, now)
     sent = 0
     for c in calls:
         try:
