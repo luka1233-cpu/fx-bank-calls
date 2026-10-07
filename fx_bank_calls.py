@@ -245,13 +245,15 @@ def source_rank(item):
     return RANK_BY_NAME.get((item.get("source") or "").lower(), 4)
 
 
-def classify(item):
+def classify(item, why=None):
     title = item["title"]
     desc = item["desc"]
     text = title if (not desc or desc[:30].lower() in title.lower() or title[:30].lower() in desc.lower()) \
         else f"{title}. {desc}"
     bank = detect_bank(title)
     if not bank:
+        if why is not None:
+            why.append("no bank in title")
         return None
 
     clauses = [c for c in CLAUSE_SPLIT.split(text) if c and c.strip()]
@@ -266,6 +268,8 @@ def classify(item):
         if d is None:
             d, flags = direction(text)
         if d is None:
+            if why is not None:
+                why.append(f"pair {pair} found but no direction/stance words")
             return None
         if inv:
             d = FLIP.get(d, d)
@@ -294,9 +298,15 @@ def classify(item):
             subj, kind = c1, "ccy"
             break
         if not subj:
+            if why is not None:
+                why.append("no G10 pair, and currency word has no direction" if ccy_list(text)
+                           else "no G10 pair or currency word in text")
             return None
         low = (text + " ").lower()
         if kind == "ccy" and any(n in low for n in NOISE):
+            if why is not None:
+                why.append("currency-only view dropped by NOISE word: "
+                           + ",".join(n.strip() for n in NOISE if n in low))
             return None
 
     # tip
@@ -479,6 +489,49 @@ def parse_feed(url, feed_name=None):
     return out
 
 
+def has_bank(s):
+    return any(re.search(rx, s or "", re.I) for _, rx in BANK_PATTERNS)
+
+
+def diagnose(items, now, calls):
+    """PRIVREMENA dijagnostika (iskljuci sa DIAG=0). Ne menja ponasanje."""
+    t = lambda x, n=140: (x or "")[:n].replace("\n", " ")
+    title_bank = [i for i in items if has_bank(i["title"])]
+    desc_only = [i for i in items if not has_bank(i["title"]) and has_bank(i["desc"])]
+    valid = [i for i in items if classify(i) is not None]
+    valid_fresh = [i for i in valid if now - i["dt"] <= MAX_AGE]
+    print("[DIAG] ==================== diagnostika ====================")
+    print(f"[DIAG] ukupno stavki: {len(items)}  (MAX_AGE={MAX_AGE})")
+    print(f"[DIAG] 1) banka u TITLE-u: {len(title_bank)}")
+    print(f"[DIAG] 2) banka samo u DESCRIPTION-u: {len(desc_only)}")
+    print(f"[DIAG] 3) prosli classify() kao valid call: {len(valid)} "
+          f"(od toga unutar MAX_AGE: {len(valid_fresh)}, posle klastera/dedup za slanje: {len(calls)})")
+    print("[DIAG] 4) prvih 10 odbijenih sa bankom samo u description-u:")
+    for i in desc_only[:10]:
+        print(f"[DIAG]    - {t(i['title'])} | source={i.get('source')}")
+    if not desc_only:
+        print("[DIAG]    (nema)")
+    print("[DIAG] 5) sve stavke sa bankom u title-u:")
+    queued = {l for c in calls for l in c["links"]}
+    for i in title_bank:
+        why = []
+        c = classify(i, why)
+        age = now - i["dt"]
+        if c is None:
+            print(f"[DIAG]    REJECT: {t(i['title'])} | source={i.get('source')} | razlog: {'; '.join(why)}")
+        elif age > MAX_AGE:
+            print(f"[DIAG]    VALID ali PRESTARO ({age.total_seconds()/3600:.1f}h): {t(i['title'])} | "
+                  f"{c['subj']} {c['dir']} {c['type']}")
+        elif i["link"] in queued:
+            print(f"[DIAG]    SEND: {t(i['title'])} | {c['subj']} {c['dir']} {c['type']}")
+        else:
+            print(f"[DIAG]    VALID ali nije za slanje (dedup/klaster/vec poslato): {t(i['title'])} | "
+                  f"{c['subj']} {c['dir']} {c['type']}")
+    if not title_bank:
+        print("[DIAG]    (nema)")
+    print("[DIAG] =====================================================")
+
+
 def send(msg):
     if DRY_RUN or not WEBHOOK:
         print(msg, "\n" + "-" * 40)
@@ -520,6 +573,8 @@ def main():
         items += parse_feed(u, name)
 
     calls = build_calls(items, state, now)
+    if os.environ.get("DIAG", "1") == "1":
+        diagnose(items, now, calls)
     sent = 0
     for c in calls:
         try:
